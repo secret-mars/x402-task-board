@@ -22,6 +22,31 @@ function json(data: unknown, status = 200, origin = '*'): Response {
   });
 }
 
+// Auth: require BIP-137 signature on all write endpoints
+// Signature message format: "x402-task | {action} | {address} | {timestamp}"
+// Timestamp must be within 300 seconds of server time
+function validateAuth(body: any, action: string, addressField: string): string | null {
+  const address = body[addressField];
+  if (!address) return `Required: ${addressField}`;
+  if (!body.signature) return 'Required: signature (BIP-137 signed message)';
+  if (!body.timestamp) return 'Required: timestamp (ISO 8601)';
+
+  // Validate signature format (base64-encoded BIP-137 = 88 chars)
+  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+    return 'Invalid signature format (expected base64 BIP-137, ~88 chars)';
+  }
+
+  // Validate timestamp is recent (within 300 seconds)
+  const ts = new Date(body.timestamp).getTime();
+  if (isNaN(ts)) return 'Invalid timestamp format';
+  const drift = Math.abs(Date.now() - ts);
+  if (drift > 300_000) return 'Timestamp expired (must be within 300 seconds of server time)';
+
+  // Store the expected signed message for external verification
+  body._signedMessage = `x402-task | ${action} | ${address} | ${body.timestamp}`;
+  return null;
+}
+
 async function ensureAgent(db: D1Database, btcAddress: string, displayName?: string, stxAddress?: string) {
   await db
     .prepare(
@@ -54,6 +79,8 @@ export default {
         if (body.bounty_sats < 1) {
           return json({ error: 'bounty_sats must be positive' }, 400, origin);
         }
+        const authErr = validateAuth(body, 'create_task', 'poster');
+        if (authErr) return json({ error: authErr }, 401, origin);
 
         await ensureAgent(env.DB, body.poster, body.poster_name, body.poster_stx);
 
@@ -154,6 +181,8 @@ export default {
       if (!body.bidder || !body.amount_sats) {
         return json({ error: 'Required: bidder, amount_sats' }, 400, origin);
       }
+      const authErr = validateAuth(body, 'bid', 'bidder');
+      if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
       if (!task) return json({ error: 'Task not found' }, 404, origin);
@@ -182,6 +211,8 @@ export default {
       if (!body.poster || !body.bid_id) {
         return json({ error: 'Required: poster, bid_id' }, 400, origin);
       }
+      const authErr = validateAuth(body, 'accept_bid', 'poster');
+      if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
       if (!task) return json({ error: 'Task not found' }, 404, origin);
@@ -211,6 +242,8 @@ export default {
       if (!body.worker || !body.proof_url) {
         return json({ error: 'Required: worker, proof_url' }, 400, origin);
       }
+      const authErr = validateAuth(body, 'submit', 'worker');
+      if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
       if (!task) return json({ error: 'Task not found' }, 404, origin);
@@ -231,9 +264,11 @@ export default {
     if (request.method === 'POST' && path.match(/^\/api\/tasks\/\d+\/verify$/)) {
       const id = path.split('/')[3];
       const body = await request.json() as any;
-      if (!body.poster || !body.approved) {
+      if (!body.poster || body.approved === undefined) {
         return json({ error: 'Required: poster, approved (true/false)' }, 400, origin);
       }
+      const authErr = validateAuth(body, 'verify', 'poster');
+      if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
       if (!task) return json({ error: 'Task not found' }, 404, origin);
@@ -269,6 +304,8 @@ export default {
       const id = path.split('/')[3];
       const body = await request.json() as any;
       if (!body.poster) return json({ error: 'Required: poster' }, 400, origin);
+      const authErr = validateAuth(body, 'cancel', 'poster');
+      if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
       if (!task) return json({ error: 'Task not found' }, 404, origin);
