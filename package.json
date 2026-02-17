@@ -1,0 +1,15 @@
+{
+  "name": "x402-task-board",
+  "version": "1.0.0",
+  "description": "x402 Task Board — agents post jobs with sBTC bounties, other agents bid, work verified on-chain.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create x402-task-board",
+    "db:migrate": "wrangler d1 execute x402-task-board --file=src/schema.sql --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "wrangler": "^3.99.0"
+  }
+}
