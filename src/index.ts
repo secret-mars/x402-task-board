@@ -105,7 +105,7 @@ export default {
 
         return json({ success: true, task_id: result.meta.last_row_id }, 201, origin);
       } catch (e: any) {
-        return json({ error: e.message }, 500, origin);
+        return json({ error: 'Internal server error' }, 500, origin);
       }
     }
 
@@ -214,17 +214,20 @@ export default {
       const authErr = validateAuth(body, 'accept_bid', 'poster');
       if (authErr) return json({ error: authErr }, 401, origin);
 
-      const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
-      if (!task) return json({ error: 'Task not found' }, 404, origin);
-      if (task.poster !== body.poster) return json({ error: 'Only the poster can accept bids' }, 403, origin);
-      if (task.status !== 'open') return json({ error: 'Task is not open' }, 400, origin);
-
       const bid = await env.DB.prepare('SELECT * FROM bids WHERE id = ? AND task_id = ?').bind(body.bid_id, id).first() as any;
       if (!bid) return json({ error: 'Bid not found' }, 404, origin);
 
+      // Atomic conditional update — prevents race condition (issue #2)
+      const update = await env.DB
+        .prepare('UPDATE tasks SET status = ?, worker = ?, bounty_sats = ?, updated_at = datetime(\'now\') WHERE id = ? AND status = ? AND poster = ?')
+        .bind('assigned', bid.bidder, bid.amount_sats, id, 'open', body.poster)
+        .run();
+
+      if (!update.meta.changes) {
+        return json({ error: 'Task already accepted or not open, or not your task' }, 409, origin);
+      }
+
       await env.DB.batch([
-        env.DB.prepare('UPDATE tasks SET status = ?, worker = ?, bounty_sats = ?, updated_at = datetime(\'now\') WHERE id = ?')
-          .bind('assigned', bid.bidder, bid.amount_sats, id),
         env.DB.prepare('UPDATE bids SET status = ? WHERE id = ?').bind('accepted', body.bid_id),
         env.DB.prepare('UPDATE bids SET status = ? WHERE task_id = ? AND id != ? AND status = ?')
           .bind('rejected', id, body.bid_id, 'pending'),
