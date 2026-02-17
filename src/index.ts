@@ -47,6 +47,73 @@ function validateAuth(body: any, action: string, addressField: string): string |
   return null;
 }
 
+// Verify an sBTC payment transaction on-chain via Hiro API
+// Checks: tx exists, is confirmed, correct contract, amount >= expected, recipient matches
+async function verifyPaymentOnChain(
+  paymentTx: string,
+  expectedMinSats: number,
+  expectedRecipientStx: string
+): Promise<{ valid: boolean; error?: string; details?: any }> {
+  // Normalize tx hash — accept with or without 0x prefix
+  const txId = paymentTx.startsWith('0x') ? paymentTx : `0x${paymentTx}`;
+
+  try {
+    const resp = await fetch(`https://api.hiro.so/extended/v1/tx/${txId}`);
+    if (!resp.ok) {
+      return { valid: false, error: `Transaction not found on Hiro API (HTTP ${resp.status})` };
+    }
+    const tx = await resp.json() as any;
+
+    // Must be confirmed
+    if (tx.tx_status !== 'success') {
+      return { valid: false, error: `Transaction status is '${tx.tx_status}', expected 'success'` };
+    }
+
+    // Must be a contract call to sBTC token
+    if (tx.tx_type !== 'contract_call') {
+      return { valid: false, error: `Transaction type is '${tx.tx_type}', expected 'contract_call'` };
+    }
+
+    const call = tx.contract_call;
+    const sbtcContract = 'SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token';
+    if (call.contract_id !== sbtcContract) {
+      return { valid: false, error: `Contract is '${call.contract_id}', expected sBTC token` };
+    }
+
+    if (call.function_name !== 'transfer') {
+      return { valid: false, error: `Function is '${call.function_name}', expected 'transfer'` };
+    }
+
+    // Parse function args: amount (uint), sender (principal), recipient (principal)
+    const args = call.function_args || [];
+    const amountArg = args.find((a: any) => a.name === 'amount');
+    const recipientArg = args.find((a: any) => a.name === 'to' || a.name === 'recipient');
+
+    if (!amountArg || !recipientArg) {
+      return { valid: false, error: 'Could not parse transfer arguments from transaction' };
+    }
+
+    // Parse Clarity uint repr: "u100000" → 100000
+    const amountSats = parseInt(amountArg.repr.replace(/^u/, ''), 10);
+    if (isNaN(amountSats) || amountSats < expectedMinSats) {
+      return { valid: false, error: `Payment amount ${amountSats} sats < required ${expectedMinSats} sats` };
+    }
+
+    // Parse Clarity principal repr: "'SP4DX..." → "SP4DX..."
+    const recipient = recipientArg.repr.replace(/^'/, '');
+    if (recipient !== expectedRecipientStx) {
+      return { valid: false, error: `Recipient '${recipient}' does not match worker '${expectedRecipientStx}'` };
+    }
+
+    return {
+      valid: true,
+      details: { txId, amountSats, recipient, sender: tx.sender_address, blockHeight: tx.block_height }
+    };
+  } catch (e: any) {
+    return { valid: false, error: `Hiro API error: ${e.message || 'unknown'}` };
+  }
+}
+
 async function ensureAgent(db: D1Database, btcAddress: string, displayName?: string, stxAddress?: string) {
   await db
     .prepare(
@@ -279,7 +346,42 @@ export default {
       if (task.status !== 'submitted') return json({ error: 'Task work not submitted yet' }, 400, origin);
 
       if (body.approved) {
-        const newStatus = body.payment_tx ? 'paid' : 'verified';
+        let newStatus = 'verified';
+        let paymentDetails = 'Awaiting payment.';
+
+        if (body.payment_tx) {
+          // Prevent double-spend: check if this tx is already used by another task
+          const existing = await env.DB
+            .prepare('SELECT id FROM tasks WHERE payment_tx = ? AND id != ?')
+            .bind(body.payment_tx, id)
+            .first();
+          if (existing) {
+            return json({ error: 'This payment transaction is already used for another task' }, 409, origin);
+          }
+
+          // Get worker's STX address for recipient verification
+          const workerAgent = await env.DB
+            .prepare('SELECT stx_address FROM agents WHERE btc_address = ?')
+            .bind(task.worker)
+            .first() as any;
+          if (!workerAgent?.stx_address) {
+            return json({ error: 'Worker has no STX address on file — cannot verify payment recipient' }, 400, origin);
+          }
+
+          // Verify payment on-chain via Hiro API
+          const verification = await verifyPaymentOnChain(
+            body.payment_tx,
+            task.bounty_sats,
+            workerAgent.stx_address
+          );
+          if (!verification.valid) {
+            return json({ error: `Payment verification failed: ${verification.error}` }, 400, origin);
+          }
+
+          newStatus = 'paid';
+          paymentDetails = `Verified on-chain: ${body.payment_tx} (${verification.details.amountSats} sats, block ${verification.details.blockHeight})`;
+        }
+
         await env.DB.batch([
           env.DB.prepare('UPDATE tasks SET status = ?, payment_tx = ?, updated_at = datetime(\'now\') WHERE id = ?')
             .bind(newStatus, body.payment_tx || null, id),
@@ -288,7 +390,7 @@ export default {
           env.DB.prepare('UPDATE agents SET reputation = reputation + 1 WHERE btc_address = ?')
             .bind(task.poster),
           env.DB.prepare('INSERT INTO activity (task_id, actor, action, details) VALUES (?, ?, ?, ?)')
-            .bind(id, body.poster, 'verified', `Approved. ${body.payment_tx ? 'Paid: ' + body.payment_tx : 'Awaiting payment.'}`),
+            .bind(id, body.poster, 'verified', `Approved. ${paymentDetails}`),
         ]);
       } else {
         await env.DB.batch([

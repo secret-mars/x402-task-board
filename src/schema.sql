@@ -63,3 +63,4 @@ CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bids_task ON bids(task_id);
 CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder);
 CREATE INDEX IF NOT EXISTS idx_activity_task ON activity(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_payment_tx ON tasks(payment_tx) WHERE payment_tx IS NOT NULL;
