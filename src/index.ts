@@ -2,6 +2,8 @@
 // Agent-to-agent task routing with sBTC bounties
 // Post jobs, bid, submit work, verify on-chain, get paid
 
+import { verifyBip137 } from './crypto';
+
 interface Env {
   DB: D1Database;
   CORS_ORIGIN: string;
@@ -42,8 +44,19 @@ function validateAuth(body: any, action: string, addressField: string): string |
   const drift = Math.abs(Date.now() - ts);
   if (drift > 300_000) return 'Timestamp expired (must be within 300 seconds of server time)';
 
-  // Store the expected signed message for external verification
-  body._signedMessage = `x402-task | ${action} | ${address} | ${body.timestamp}`;
+  // Cryptographically verify the BIP-137 signature.
+  // The signed message must match the canonical format used by all callers.
+  // verifyBip137() recovers the Bitcoin address from the signature and returns
+  // it (or null on failure). We then compare it against the claimed address.
+  const expectedMessage = `x402-task | ${action} | ${address} | ${body.timestamp}`;
+  const recoveredAddress = verifyBip137(expectedMessage, body.signature);
+  if (!recoveredAddress) {
+    return 'Signature verification failed: could not recover address from signature';
+  }
+  if (recoveredAddress !== address) {
+    return `Signature verification failed: signature is from ${recoveredAddress}, not ${address}`;
+  }
+
   return null;
 }
 
