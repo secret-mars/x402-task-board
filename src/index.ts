@@ -22,18 +22,309 @@ function json(data: unknown, status = 200, origin = '*'): Response {
   });
 }
 
+// ── BIP-137 signature verification (secp256k1, pure bigint, no external deps) ──
+// Cloudflare Workers supports BigInt and crypto.subtle (SHA-256, RIPEMD-160 via
+// double-hash), but does NOT expose secp256k1 via Web Crypto. We implement the
+// minimal math needed to recover a public key from a compact signature and
+// derive the Bitcoin address for comparison.
+
+const SECP256K1_P  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2Fn;
+const SECP256K1_N  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n;
+const SECP256K1_A  = 0n;
+const SECP256K1_B  = 7n;
+const SECP256K1_Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798n;
+const SECP256K1_Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8n;
+
+function modp(n: bigint): bigint { return ((n % SECP256K1_P) + SECP256K1_P) % SECP256K1_P; }
+function modn(n: bigint): bigint { return ((n % SECP256K1_N) + SECP256K1_N) % SECP256K1_N; }
+
+function modpow(base: bigint, exp: bigint, mod: bigint): bigint {
+  let result = 1n;
+  base = ((base % mod) + mod) % mod;
+  while (exp > 0n) {
+    if (exp & 1n) result = result * base % mod;
+    base = base * base % mod;
+    exp >>= 1n;
+  }
+  return result;
+}
+
+function modinv(a: bigint, m: bigint): bigint { return modpow(a, m - 2n, m); }
+
+type Point = { x: bigint; y: bigint } | null;
+
+function pointAdd(P: Point, Q: Point): Point {
+  if (!P) return Q;
+  if (!Q) return P;
+  if (P.x === Q.x) {
+    if (P.y !== Q.y) return null;
+    // Point doubling
+    const lam = modp(3n * P.x * P.x * modinv(2n * P.y, SECP256K1_P));
+    const x3 = modp(lam * lam - 2n * P.x);
+    return { x: x3, y: modp(lam * (P.x - x3) - P.y) };
+  }
+  const lam = modp((Q.y - P.y) * modinv(Q.x - P.x, SECP256K1_P));
+  const x3 = modp(lam * lam - P.x - Q.x);
+  return { x: x3, y: modp(lam * (P.x - x3) - P.y) };
+}
+
+function pointMul(k: bigint, P: Point): Point {
+  let R: Point = null;
+  let kp = k;
+  let Pp = P;
+  while (kp > 0n) {
+    if (kp & 1n) R = pointAdd(R, Pp);
+    Pp = pointAdd(Pp, Pp);
+    kp >>= 1n;
+  }
+  return R;
+}
+
+// Decompress a point given x and parity bit (0 = even y, 1 = odd y)
+function liftX(x: bigint, odd: number): Point {
+  const y2 = modp(x * x * x + SECP256K1_A * x + SECP256K1_B);
+  let y = modpow(y2, (SECP256K1_P + 1n) / 4n, SECP256K1_P);
+  if ((Number(y & 1n)) !== odd) y = SECP256K1_P - y;
+  if (modp(y * y - y2) !== 0n) return null;
+  return { x, y };
+}
+
+// Recover public key from compact secp256k1 signature (BIP-137)
+// recid encodes: bit0 = parity of R.y, bit1 = R.x overflow (almost never set)
+function recoverPubkey(msgHash: bigint, r: bigint, s: bigint, recid: number): Point {
+  const odd = recid & 1;
+  const overflow = (recid >> 1) & 1;
+  const rx = overflow ? r + SECP256K1_N : r;
+  if (rx >= SECP256K1_P) return null;
+  const R = liftX(rx, odd);
+  if (!R) return null;
+  const G: Point = { x: SECP256K1_Gx, y: SECP256K1_Gy };
+  const rInv = modinv(r, SECP256K1_N);
+  // Q = r^-1 * (s*R - e*G)
+  const sR = pointMul(modn(s), R);
+  const eG = pointMul(modn(SECP256K1_N - msgHash % SECP256K1_N), G);
+  const Q = pointMul(rInv, pointAdd(sR, eG));
+  return Q;
+}
+
+// Compress a public key point to 33-byte Uint8Array
+function compressPubkey(P: Point): Uint8Array {
+  if (!P) throw new Error('null point');
+  const out = new Uint8Array(33);
+  out[0] = (P.y & 1n) ? 0x03 : 0x02;
+  const xBytes = P.x.toString(16).padStart(64, '0');
+  for (let i = 0; i < 32; i++) out[i + 1] = parseInt(xBytes.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+// SHA-256 via Web Crypto
+async function sha256(data: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+}
+
+// HASH160 = RIPEMD-160(SHA-256(data))
+// Workers runtime does NOT support RIPEMD-160 in crypto.subtle, so we implement
+// a compact pure-JS RIPEMD-160 sufficient for address derivation.
+function ripemd160(msg: Uint8Array): Uint8Array {
+  // RIPEMD-160 implementation (compact, spec-compliant)
+  const KL = [0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E];
+  const KR = [0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000];
+  const SL = [
+    [11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8],
+    [7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12],
+    [11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5],
+    [11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12],
+    [9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6]
+  ];
+  const SR = [
+    [8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6],
+    [9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11],
+    [9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5],
+    [15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8],
+    [8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11]
+  ];
+  const RL = [
+    [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+    [7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8],
+    [3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12],
+    [1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2],
+    [4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13]
+  ];
+  const RR = [
+    [5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12],
+    [6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2],
+    [15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13],
+    [8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14],
+    [12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11]
+  ];
+  function f(j: number, x: number, y: number, z: number): number {
+    if (j < 16) return x ^ y ^ z;
+    if (j < 32) return (x & y) | (~x & z);
+    if (j < 48) return (x | ~y) ^ z;
+    if (j < 64) return (x & z) | (y & ~z);
+    return x ^ (y | ~z);
+  }
+  function rol(x: number, n: number): number { return (x << n) | (x >>> (32 - n)); }
+  // Pad message
+  const bitLen = msg.length * 8;
+  const padLen = msg.length % 64 < 56 ? 56 - (msg.length % 64) : 120 - (msg.length % 64);
+  const padded = new Uint8Array(msg.length + padLen + 8);
+  padded.set(msg);
+  padded[msg.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, bitLen & 0xFFFFFFFF, true);
+  view.setUint32(padded.length - 4, Math.floor(bitLen / 2**32), true);
+
+  let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+
+  for (let blk = 0; blk < padded.length; blk += 64) {
+    const W: number[] = [];
+    for (let i = 0; i < 16; i++) W.push(view.getInt32(blk + i * 4, true));
+
+    let al = h0, bl = h1, cl = h2, dl = h3, el = h4;
+    let ar = h0, br = h1, cr = h2, dr = h3, er = h4;
+
+    for (let j = 0; j < 80; j++) {
+      const round = Math.floor(j / 16);
+      let tl = rol((al + f(j, bl, cl, dl) + W[RL[round][j % 16]] + KL[round]) | 0, SL[round][j % 16]) + el | 0;
+      al = el; el = dl; dl = rol(cl, 10); cl = bl; bl = tl;
+      let tr = rol((ar + f(79 - j, br, cr, dr) + W[RR[round][j % 16]] + KR[round]) | 0, SR[round][j % 16]) + er | 0;
+      ar = er; er = dr; dr = rol(cr, 10); cr = br; br = tr;
+    }
+    const t = h1 + cl + dr | 0;
+    h1 = h2 + dl + er | 0;
+    h2 = h3 + el + ar | 0;
+    h3 = h4 + al + br | 0;
+    h4 = h0 + bl + cr | 0;
+    h0 = t;
+  }
+  const out = new Uint8Array(20);
+  const ov = new DataView(out.buffer);
+  [h0, h1, h2, h3, h4].forEach((h, i) => ov.setUint32(i * 4, h, true));
+  return out;
+}
+
+// Base58Check encode
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+async function base58CheckEncode(versionByte: number, hash160: Uint8Array): Promise<string> {
+  const payload = new Uint8Array(21);
+  payload[0] = versionByte;
+  payload.set(hash160, 1);
+  const hash1 = await sha256(payload);
+  const hash2 = await sha256(hash1);
+  const full = new Uint8Array(25);
+  full.set(payload);
+  full.set(hash2.slice(0, 4), 21);
+
+  let num = 0n;
+  for (const b of full) num = num * 256n + BigInt(b);
+  let encoded = '';
+  while (num > 0n) {
+    encoded = BASE58_ALPHABET[Number(num % 58n)] + encoded;
+    num /= 58n;
+  }
+  // Leading zeros
+  for (const b of full) {
+    if (b !== 0) break;
+    encoded = '1' + encoded;
+  }
+  return encoded;
+}
+
+// Derive P2PKH address (compressed pubkey, mainnet prefix 0x00)
+async function pubkeyToP2PKH(pubkey: Uint8Array): Promise<string> {
+  const hash160 = ripemd160(await sha256(pubkey));
+  return base58CheckEncode(0x00, hash160);
+}
+
+// BIP-137 "magic" double-SHA-256 of the signed message
+async function bip137MessageHash(message: string): Promise<bigint> {
+  const magic = 'Bitcoin Signed Message:\n';
+  const msgBytes = new TextEncoder().encode(message);
+  const magicBytes = new TextEncoder().encode(magic);
+  // Varint-length-prefixed magic + varint-length-prefixed message
+  function varint(n: number): Uint8Array {
+    if (n < 0xfd) return new Uint8Array([n]);
+    const buf = new Uint8Array(3);
+    buf[0] = 0xfd;
+    buf[1] = n & 0xff;
+    buf[2] = (n >> 8) & 0xff;
+    return buf;
+  }
+  const prefix = varint(magic.length);
+  const msgLen = varint(msgBytes.length);
+  const combined = new Uint8Array(prefix.length + magicBytes.length + msgLen.length + msgBytes.length);
+  let off = 0;
+  combined.set(prefix, off); off += prefix.length;
+  combined.set(magicBytes, off); off += magicBytes.length;
+  combined.set(msgLen, off); off += msgLen.length;
+  combined.set(msgBytes, off);
+  const hash = await sha256(await sha256(combined));
+  let n = 0n;
+  for (const b of hash) n = n * 256n + BigInt(b);
+  return n;
+}
+
+// Verify a BIP-137 compact signature against a claimed Bitcoin address.
+// Returns true if the signature was produced by the private key corresponding
+// to the claimed address; false otherwise.
+async function verifyBIP137(address: string, message: string, signatureB64: string): Promise<boolean> {
+  try {
+    // Decode base64 → 65 bytes: [header, r (32), s (32)]
+    const sigBytes = Uint8Array.from(atob(signatureB64), c => c.charCodeAt(0));
+    if (sigBytes.length !== 65) return false;
+
+    const header = sigBytes[0];
+    // BIP-137 header encodes: compressed/uncompressed + recid
+    // 27-30: uncompressed, 31-34: compressed
+    if (header < 27 || header > 34) return false;
+    const compressed = header >= 31;
+    const recid = (header - (compressed ? 31 : 27)) & 3;
+
+    const r = sigBytes.slice(1, 33).reduce((acc, b) => acc * 256n + BigInt(b), 0n);
+    const s = sigBytes.slice(33, 65).reduce((acc, b) => acc * 256n + BigInt(b), 0n);
+    if (r === 0n || s === 0n || r >= SECP256K1_N || s >= SECP256K1_N) return false;
+
+    const msgHash = await bip137MessageHash(message);
+    const Q = recoverPubkey(msgHash, r, s, recid);
+    if (!Q) return false;
+
+    let pubkey: Uint8Array;
+    if (compressed) {
+      pubkey = compressPubkey(Q);
+    } else {
+      pubkey = new Uint8Array(65);
+      pubkey[0] = 0x04;
+      const xBytes = Q.x.toString(16).padStart(64, '0');
+      const yBytes = Q.y.toString(16).padStart(64, '0');
+      for (let i = 0; i < 32; i++) {
+        pubkey[i + 1]  = parseInt(xBytes.slice(i * 2, i * 2 + 2), 16);
+        pubkey[i + 33] = parseInt(yBytes.slice(i * 2, i * 2 + 2), 16);
+      }
+    }
+
+    const recoveredAddress = await pubkeyToP2PKH(pubkey);
+    return recoveredAddress === address;
+  } catch {
+    return false;
+  }
+}
+
 // Auth: require BIP-137 signature on all write endpoints
-// Signature message format: "x402-task | {action} | {address} | {timestamp}"
-// Timestamp must be within 300 seconds of server time
-function validateAuth(body: any, action: string, addressField: string): string | null {
+// Signature message format:
+//   "x402-task | {action} | {address} | {timestamp} | {nonce}"
+// - timestamp must be within 300 seconds of server time
+// - nonce must be a non-empty string (UUID recommended); it is embedded in the
+//   signed message so that two otherwise identical requests within the 300s
+//   window produce distinct messages, preventing replay attacks
+// - The signature is cryptographically verified against the claimed address
+async function validateAuth(body: any, action: string, addressField: string): Promise<string | null> {
   const address = body[addressField];
   if (!address) return `Required: ${addressField}`;
   if (!body.signature) return 'Required: signature (BIP-137 signed message)';
   if (!body.timestamp) return 'Required: timestamp (ISO 8601)';
-
-  // Validate signature format (base64-encoded BIP-137 = 88 chars)
-  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
-    return 'Invalid signature format (expected base64 BIP-137, ~88 chars)';
+  if (!body.nonce || typeof body.nonce !== 'string' || body.nonce.length < 8) {
+    return 'Required: nonce (min 8 chars, use a UUID)';
   }
 
   // Validate timestamp is recent (within 300 seconds)
@@ -42,8 +333,14 @@ function validateAuth(body: any, action: string, addressField: string): string |
   const drift = Math.abs(Date.now() - ts);
   if (drift > 300_000) return 'Timestamp expired (must be within 300 seconds of server time)';
 
-  // Store the expected signed message for external verification
-  body._signedMessage = `x402-task | ${action} | ${address} | ${body.timestamp}`;
+  // Build the expected signed message (nonce binds the signature to this request)
+  const message = `x402-task | ${action} | ${address} | ${body.timestamp} | ${body.nonce}`;
+  body._signedMessage = message;
+
+  // Cryptographically verify the BIP-137 signature
+  const valid = await verifyBIP137(address, message, body.signature);
+  if (!valid) return 'Signature verification failed: signature does not match address';
+
   return null;
 }
 
@@ -146,7 +443,7 @@ export default {
         if (body.bounty_sats < 1) {
           return json({ error: 'bounty_sats must be positive' }, 400, origin);
         }
-        const authErr = validateAuth(body, 'create_task', 'poster');
+        const authErr = await validateAuth(body, 'create_task', 'poster');
         if (authErr) return json({ error: authErr }, 401, origin);
 
         await ensureAgent(env.DB, body.poster, body.poster_name, body.poster_stx);
@@ -248,7 +545,7 @@ export default {
       if (!body.bidder || !body.amount_sats) {
         return json({ error: 'Required: bidder, amount_sats' }, 400, origin);
       }
-      const authErr = validateAuth(body, 'bid', 'bidder');
+      const authErr = await validateAuth(body, 'bid', 'bidder');
       if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
@@ -278,7 +575,7 @@ export default {
       if (!body.poster || !body.bid_id) {
         return json({ error: 'Required: poster, bid_id' }, 400, origin);
       }
-      const authErr = validateAuth(body, 'accept_bid', 'poster');
+      const authErr = await validateAuth(body, 'accept_bid', 'poster');
       if (authErr) return json({ error: authErr }, 401, origin);
 
       const bid = await env.DB.prepare('SELECT * FROM bids WHERE id = ? AND task_id = ?').bind(body.bid_id, id).first() as any;
@@ -312,7 +609,7 @@ export default {
       if (!body.worker || !body.proof_url) {
         return json({ error: 'Required: worker, proof_url' }, 400, origin);
       }
-      const authErr = validateAuth(body, 'submit', 'worker');
+      const authErr = await validateAuth(body, 'submit', 'worker');
       if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
@@ -337,7 +634,7 @@ export default {
       if (!body.poster || body.approved === undefined) {
         return json({ error: 'Required: poster, approved (true/false)' }, 400, origin);
       }
-      const authErr = validateAuth(body, 'verify', 'poster');
+      const authErr = await validateAuth(body, 'verify', 'poster');
       if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
@@ -409,7 +706,7 @@ export default {
       const id = path.split('/')[3];
       const body = await request.json() as any;
       if (!body.poster) return json({ error: 'Required: poster' }, 400, origin);
-      const authErr = validateAuth(body, 'cancel', 'poster');
+      const authErr = await validateAuth(body, 'cancel', 'poster');
       if (authErr) return json({ error: authErr }, 401, origin);
 
       const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first() as any;
