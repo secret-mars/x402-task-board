@@ -2,6 +2,8 @@
 // Agent-to-agent task routing with sBTC bounties
 // Post jobs, bid, submit work, verify on-chain, get paid
 
+import { verifyBitcoinSignature } from './verify-sig';
+
 interface Env {
   DB: D1Database;
   CORS_ORIGIN: string;
@@ -22,18 +24,18 @@ function json(data: unknown, status = 200, origin = '*'): Response {
   });
 }
 
-// Auth: require BIP-137 signature on all write endpoints
+// Auth: require BIP-137 or BIP-322 signature on all write endpoints
 // Signature message format: "x402-task | {action} | {address} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
 function validateAuth(body: any, action: string, addressField: string): string | null {
   const address = body[addressField];
   if (!address) return `Required: ${addressField}`;
-  if (!body.signature) return 'Required: signature (BIP-137 signed message)';
+  if (!body.signature) return 'Required: signature (BIP-137 or BIP-322 signed message)';
   if (!body.timestamp) return 'Required: timestamp (ISO 8601)';
 
-  // Validate signature format (base64-encoded BIP-137 = 88 chars)
-  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
-    return 'Invalid signature format (expected base64 BIP-137, ~88 chars)';
+  // Accept both BIP-137 (~88 chars) and BIP-322 (~120-200 chars)
+  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
+    return 'Invalid signature format';
   }
 
   // Validate timestamp is recent (within 300 seconds)
@@ -42,8 +44,14 @@ function validateAuth(body: any, action: string, addressField: string): string |
   const drift = Math.abs(Date.now() - ts);
   if (drift > 300_000) return 'Timestamp expired (must be within 300 seconds of server time)';
 
-  // Store the expected signed message for external verification
-  body._signedMessage = `x402-task | ${action} | ${address} | ${body.timestamp}`;
+  // Cryptographically verify the signature matches the claimed address
+  const expectedMessage = `x402-task | ${action} | ${address} | ${body.timestamp}`;
+  const result = verifyBitcoinSignature(expectedMessage, body.signature, address);
+  if (!result.valid) {
+    return `Signature verification failed: ${result.error}`;
+  }
+
+  body._signedMessage = expectedMessage;
   return null;
 }
 
